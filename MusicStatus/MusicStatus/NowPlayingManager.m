@@ -47,6 +47,7 @@
         __block NSString *aName = nil;
         __block double elapsed = 0.0;
         __block double dur = 0.0;
+        __block NSString *vlcPath = nil; // Tracks VLC's file path for local artwork lookups
         BOOL success = NO;
         
         // 1. APPLE MUSIC EVALUATION
@@ -60,7 +61,6 @@
                                           @"end if\n"
                                           @"end tell"];
             NSAppleEventDescriptor *descriptor = [musicScript executeAndReturnError:nil];
-            
             if (descriptor && [descriptor numberOfItems] >= 4) {
                 tName = [[descriptor descriptorAtIndex:1] stringValue];
                 aName = [[descriptor descriptorAtIndex:2] stringValue];
@@ -81,43 +81,57 @@
                                             @"end if\n"
                                             @"end tell"];
             NSAppleEventDescriptor *descriptor = [spotifyScript executeAndReturnError:nil];
-            
             if (descriptor && [descriptor numberOfItems] >= 4) {
                 tName = [[descriptor descriptorAtIndex:1] stringValue];
                 aName = [[descriptor descriptorAtIndex:2] stringValue];
                 elapsed = [[descriptor descriptorAtIndex:3] doubleValue];
                 dur = [[descriptor descriptorAtIndex:4] doubleValue];
-                
-                if (dur > 2000) {
-                    elapsed = elapsed / 1000.0;
-                    dur = dur / 1000.0;
-                }
+                if (dur > 2000) { elapsed /= 1000.0; dur /= 1000.0; }
                 if (tName && ![tName isEqualToString:@"No Track Playing"]) success = YES;
             }
         }
         
-        // 3. VLC EVALUATION
+        // 3. VLC EVALUATION (WITH DYNAMIC STRING PARSING)
         if (vlcRunning && !success) {
+            // We also ask VLC for the raw path of the current item to trace local artwork files!
             NSAppleScript *vlcScript = [[NSAppleScript alloc] initWithSource:
                                         @"tell application \"VLC\"\n"
                                         @"if playing then\n"
-                                        @"return {name of current item, \"VLC Player\", current time, duration of current item}\n"
+                                        @"return {name of current item, current time, duration of current item, path of current item}\n"
                                         @"else\n"
-                                        @"return {\"No Track Playing\", \"—\", 0.0, 0.0}\n"
+                                        @"return {\"No Track Playing\", 0.0, 0.0, \"\"}\n"
                                         @"end if\n"
                                         @"end tell"];
             NSAppleEventDescriptor *descriptor = [vlcScript executeAndReturnError:nil];
-            
             if (descriptor && [descriptor numberOfItems] >= 4) {
-                tName = [[descriptor descriptorAtIndex:1] stringValue];
-                aName = [[descriptor descriptorAtIndex:2] stringValue];
-                elapsed = [[descriptor descriptorAtIndex:3] doubleValue];
-                dur = [[descriptor descriptorAtIndex:4] doubleValue];
-                if (tName && ![tName isEqualToString:@"No Track Playing"]) success = YES;
+                NSString *rawVlcTitle = [[descriptor descriptorAtIndex:1] stringValue];
+                elapsed = [[descriptor descriptorAtIndex:2] doubleValue];
+                dur = [[descriptor descriptorAtIndex:3] doubleValue];
+                vlcPath = [[descriptor descriptorAtIndex:4] stringValue];
+                
+                if (rawVlcTitle && ![rawVlcTitle isEqualToString:@"No Track Playing"]) {
+                    // Smart String Splitter: Look for the classic " - " divider separator
+                    if ([rawVlcTitle containsString:@" - "]) {
+                        NSArray *components = [rawVlcTitle componentsSeparatedByString:@" - "];
+                        aName = [components firstObject];
+                        
+                        // Recombine the rest of the string just in case the track name contains a hyphen too
+                        NSMutableArray *trackComponents = [components mutableCopy];
+                        [trackComponents removeObjectAtIndex:0];
+                        tName = [trackComponents componentsJoinedByString:@" - "];
+                        
+                        // Clean up file extensions if VLC is displaying the raw file name (.mp3, .m4a, etc)
+                        tName = [tName stringByDeletingPathExtension];
+                    } else {
+                        tName = [rawVlcTitle stringByDeletingPathExtension];
+                        aName = @"VLC Player";
+                    }
+                    success = YES;
+                }
             }
         }
         
-        // 4. MAIN THREAD UI UPDATE
+        // 4. MAIN THREAD UI BROADCAST
         dispatch_async(dispatch_get_main_queue(), ^{
             BOOL trackChanged = ![tName isEqualToString:self->_trackName];
             
@@ -136,19 +150,24 @@
             
             [self notifyUI];
             
-            // Only fire the slow artwork compilation engine if the track actually changes!
             if (success && trackChanged) {
-                [self fetchArtworkWithMusicRunning:musicRunning spotifyRunning:spotifyRunning vlcRunning:vlcRunning];
+                [self fetchArtworkWithMusicRunning:musicRunning
+                                    spotifyRunning:spotifyRunning
+                                        vlcRunning:vlcRunning
+                                           vlcPath:vlcPath];
             }
         });
     });
 }
 
-- (void)fetchArtworkWithMusicRunning:(BOOL)musicRunning spotifyRunning:(BOOL)spotifyRunning vlcRunning:(BOOL)vlcRunning {
+- (void)fetchArtworkWithMusicRunning:(BOOL)musicRunning
+                      spotifyRunning:(BOOL)spotifyRunning
+                          vlcRunning:(BOOL)vlcRunning
+                             vlcPath:(NSString *)vlcPath {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         __block NSImage *img = nil;
         
-        // FIXED APPLE MUSIC ARTWORK EXTRACTION
+        // APPLE MUSIC EXTRACTION
         if (musicRunning) {
             NSString *musicSrc = @"tell application \"Music\"\n"
                                  @"if exists (current track) then\n"
@@ -162,7 +181,6 @@
                                  @"end tell";
             NSAppleScript *scr = [[NSAppleScript alloc] initWithSource:musicSrc];
             NSAppleEventDescriptor *desc = [scr executeAndReturnError:nil];
-            
             if (desc && [desc descriptorType] != 'msng') {
                 NSData *rawData = [desc data];
                 if (rawData && rawData.length > 0) {
@@ -175,7 +193,7 @@
             }
         }
         
-        // SPOTIFY ARTWORK EXTRACTION
+        // SPOTIFY EXTRACTION
         if (!img && spotifyRunning) {
             NSString *spotSrc = @"tell application \"Spotify\" to get artwork url of current track";
             NSAppleScript *scr = [[NSAppleScript alloc] initWithSource:spotSrc];
@@ -184,6 +202,26 @@
             if (urlStr && [urlStr hasPrefix:@"http"]) {
                 NSData *data = [NSData dataWithContentsOfURL:[NSURL URLWithString:urlStr]];
                 if (data) img = [[NSImage alloc] initWithData:data];
+            }
+        }
+        
+        // SMART VLC ARTWORK EXTRACTION (LOCAL FILE COVERS)
+        if (!img && vlcRunning && vlcPath && vlcPath.length > 0) {
+            NSURL *fileURL = [NSURL fileURLWithPath:vlcPath];
+            NSURL *directoryURL = [fileURL URLByDeletingLastPathComponent];
+            NSURL *fileURLNoExtension = [fileURL URLByDeletingPathExtension];
+            NSString *fileNameNoExtension = [fileURLNoExtension lastPathComponent];
+            NSString *jpegExtension = @".jpg";
+            NSString *albumArtJpegFile = [fileNameNoExtension stringByAppendingString:jpegExtension];
+            // Traditional album art names stored alongside local media tracks
+            NSArray *artworkNames = @[@"cover.jpg", @"cover.png", @"album.jpg", @"folder.jpg", @"Folder.jpg", albumArtJpegFile];
+            
+            for (NSString *artName in artworkNames) {
+                NSURL *artURL = [directoryURL URLByAppendingPathComponent:artName];
+                if ([[NSFileManager defaultManager] fileExistsAtPath:artURL.path]) {
+                    img = [[NSImage alloc] initWithContentsOfURL:artURL];
+                    if (img) break;
+                }
             }
         }
         

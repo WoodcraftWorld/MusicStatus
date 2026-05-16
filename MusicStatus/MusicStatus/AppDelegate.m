@@ -17,8 +17,11 @@
     NowPlayingManager *_nowPlayingManager;
     NSTimer *_progressTimer;
     NSTimeInterval _currentLiveElapsed;
+    
 }
-
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
+    return YES;
+}
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     // Initialize the media manager
     _nowPlayingManager = [[NowPlayingManager alloc] init];
