@@ -36,10 +36,13 @@
         
         BOOL musicRunning = NO;
         BOOL spotifyRunning = NO;
+        BOOL vlcRunning = NO;
         
+        // 1. Check if VLC is active alongside the other players
         for (NSRunningApplication *app in [[NSWorkspace sharedWorkspace] runningApplications]) {
             if ([app.bundleIdentifier isEqualToString:@"com.apple.Music"]) musicRunning = YES;
             if ([app.bundleIdentifier isEqualToString:@"com.spotify.client"]) spotifyRunning = YES;
+            if ([app.bundleIdentifier isEqualToString:@"org.videolan.vlc"]) vlcRunning = YES;
         }
         
         __block NSString *tName = nil;
@@ -48,7 +51,7 @@
         __block double dur = 0.0;
         BOOL success = NO;
         
-        // 1. EVALUATE APPLE MUSIC
+        // 2. TRY APPLE MUSIC
         if (musicRunning) {
             NSAppleScript *musicScript = [[NSAppleScript alloc] initWithSource:
                                           @"tell application \"Music\"\n"
@@ -69,7 +72,7 @@
             }
         }
         
-        // 2. EVALUATE SPOTIFY FALLBACK
+        // 3. TRY SPOTIFY
         if (spotifyRunning && !success) {
             NSAppleScript *spotifyScript = [[NSAppleScript alloc] initWithSource:
                                             @"tell application \"Spotify\"\n"
@@ -95,7 +98,29 @@
             }
         }
         
-        // 3. BROADCAST TEXT METADATA
+        // 4. TRY VLC NEW FALLBACK
+        if (vlcRunning && !success) {
+            // VLC scripting language maps to "name of current item" and "currentTime" / "duration"
+            NSAppleScript *vlcScript = [[NSAppleScript alloc] initWithSource:
+                                        @"tell application \"VLC\"\n"
+                                        @"if playing then\n"
+                                        @"return {name of current item, \"VLC Player\", current time, duration of current item}\n"
+                                        @"else\n"
+                                        @"return {\"No Track Playing\", \"—\", 0.0, 0.0}\n"
+                                        @"end if\n"
+                                        @"end tell"];
+            NSAppleEventDescriptor *descriptor = [vlcScript executeAndReturnError:nil];
+            
+            if (descriptor && [descriptor numberOfItems] >= 4) {
+                tName = [[descriptor descriptorAtIndex:1] stringValue];
+                aName = [[descriptor descriptorAtIndex:2] stringValue];
+                elapsed = [[descriptor descriptorAtIndex:3] doubleValue];
+                dur = [[descriptor descriptorAtIndex:4] doubleValue];
+                success = YES;
+            }
+        }
+        
+        // 5. UPDATE TEXT MAIN THREAD PIPELINE
         dispatch_async(dispatch_get_main_queue(), ^{
             if (success && tName && ![tName isEqualToString:@"No Track Playing"]) {
                 self->_trackName = tName;
@@ -107,58 +132,42 @@
                 self->_artistName = @"—";
                 self->_elapsedTime = 0.0;
                 self->_duration = 0.0;
-                self->_albumArt = [NSImage imageNamed:NSImageNameTouchBarAudioInputTemplate];
+                self->_albumArt = [NSImage imageNamed:@"NoArtworkPlaceholder"];
             }
             [self notifyUI];
         });
         
-        // 4. TRIGGER DECOUPLED ARTWORK DOWNLOAD
+        // 6. PROCESS ARTWORK WITH VLC RUNNING ARGS
         if (success && tName && ![tName isEqualToString:@"No Track Playing"]) {
-            [self fetchArtworkForCurrentTrackWithMusicRunning:musicRunning spotifyRunning:spotifyRunning];
+            [self fetchArtworkForCurrentTrackWithMusicRunning:musicRunning
+                                              spotifyRunning:spotifyRunning
+                                                  vlcRunning:vlcRunning];
         }
     });
 }
 
-- (void)fetchArtworkForCurrentTrackWithMusicRunning:(BOOL)musicRunning spotifyRunning:(BOOL)spotifyRunning {
+- (void)fetchArtworkForCurrentTrackWithMusicRunning:(BOOL)musicRunning
+                                     spotifyRunning:(BOOL)spotifyRunning
+                                         vlcRunning:(BOOL)vlcRunning {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         __block NSImage *img = nil;
         
+        // Apple Music Extraction
         if (musicRunning) {
-            // We tell AppleScript to export the artwork data explicitly as a raw PICT/JPEG payload
             NSString *musicSrc = @"tell application \"Music\"\n"
-                                 @"if exists (current track) then\n"
-                                 @"tell current track\n"
-                                 @"if exists (artwork 1) then\n"
-                                 @"set rawData to data of artwork 1\n"
-                                 @"return rawData\n"
-                                 @"end if\n"
-                                 @"end tell\n"
+                                 @"if exists (current track) and exists (artwork 1 of current track) then\n"
+                                 @"return data of artwork 1 of current track\n"
                                  @"end if\n"
                                  @"return missing value\n"
                                  @"end tell";
-            
             NSAppleScript *scr = [[NSAppleScript alloc] initWithSource:musicSrc];
             NSAppleEventDescriptor *desc = [scr executeAndReturnError:nil];
-            
             if (desc && [desc descriptorType] != 'msng') {
-                // Get the raw byte data from the Apple Event descriptor
-                NSData *rawData = [desc data];
-                
-                if (rawData && rawData.length > 0) {
-                    // Modern Apple Music embeds raw JPEG/PNG data inside an NSAppleEventDescriptor container.
-                    // If regular initialization fails, we strip the Apple Event descriptor header bytes.
-                    img = [[NSImage alloc] initWithData:rawData];
-                    
-                    if (!img && rawData.length > 512) {
-                        // Fallback: Strip potential legacy AppleScript data type headers (frequently 512 bytes)
-                        NSData *strippedData = [rawData subdataWithRange:NSMakeRange(512, rawData.length - 512)];
-                        img = [[NSImage alloc] initWithData:strippedData];
-                    }
-                }
+                img = [[NSImage alloc] initWithData:[desc data]];
             }
         }
         
-        // --- SPOTIFY FALLBACK ---
+        // Spotify Extraction
         if (!img && spotifyRunning) {
             NSString *spotSrc = @"tell application \"Spotify\" to get artwork url of current track";
             NSAppleScript *scr = [[NSAppleScript alloc] initWithSource:spotSrc];
@@ -170,18 +179,15 @@
             }
         }
         
+        // VLC Fallback Note: VLC does not store album art blocks inside its AppleScript system API.
+        // It will safely cascade directly to your "NoArtworkPlaceholder" layout structure.
+        
         dispatch_async(dispatch_get_main_queue(), ^{
-            // Update the image view on the main thread
-            if (img) {
-                self->_albumArt = img;
-            } else {
-                self->_albumArt = [NSImage imageNamed:NSImageNameTouchBarAudioInputTemplate];
-            }
+            self->_albumArt = img ?: [NSImage imageNamed:@"NoArtworkPlaceholder"];
             [self notifyUI];
         });
     });
 }
-
 - (void)notifyUI {
     [[NSNotificationCenter defaultCenter] postNotificationName:@"NowPlayingDataUpdatedNotification" object:nil];
 }
