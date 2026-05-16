@@ -1,9 +1,14 @@
 #import "NowPlayingManager.h"
+#import <Cocoa/Cocoa.h>
+
+// This private interface lets our methods talk to each other without compilation errors
+@interface NowPlayingManager ()
+- (void)fetchArtworkForCurrentTrackWithMusicRunning:(BOOL)musicRunning spotifyRunning:(BOOL)spotifyRunning;
+@end
 
 @implementation NowPlayingManager
 
 - (void)startObservingNowPlaying {
-    // 1. Listen for standard Apple Player notification broadcasts
     NSDistributedNotificationCenter *center = [NSDistributedNotificationCenter defaultCenter];
     
     // Apple Music updates
@@ -18,132 +23,157 @@
                    name:@"com.spotify.client.PlaybackStateChanged"
                  object:nil];
     
-    // Trigger an initial manual state pull
     [self updateNowPlayingInfo];
 }
 
 - (void)playerInfoChanged:(NSNotification *)notification {
-    NSDictionary *userInfo = notification.userInfo;
-    if (!userInfo) return;
-    
-    // Map tracking properties based on which player broadcasted
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if ([notification.name containsString:@"Music"]) {
-            // Apple Music payload format
-            self->_trackName = userInfo[@"Name"] ?: @"Unknown Title";
-            self->_artistName = userInfo[@"Artist"] ?: @"Unknown Artist";
-            
-            NSNumber *durationNum = userInfo[@"Total Time"]; // given in milliseconds
-            self->_duration = durationNum ? ([durationNum doubleValue] / 1000.0) : 0.0;
-        } else {
-            // Spotify payload format
-            self->_trackName = userInfo[@"Track"] ?: @"Unknown Title";
-            self->_artistName = userInfo[@"Artist"] ?: @"Unknown Artist";
-            
-            NSNumber *durationNum = userInfo[@"Duration"]; // given in milliseconds
-            self->_duration = durationNum ? ([durationNum doubleValue] / 1000.0) : 0.0;
-        }
-        
-        // Reset local timer state offset back to zero on track modifications
-        self->_elapsedTime = 0.0;
-        
-        // Fetch artwork using our script fallbacks
-        [self fetchArtworkForCurrentTrack];
-    });
+    // Whenever a track shifts, trigger a fresh evaluation loop
+    [self updateNowPlayingInfo];
 }
 
 - (void)updateNowPlayingInfo {
-    // Run this on a background thread so the UI never pinwheels
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         
         BOOL musicRunning = NO;
         BOOL spotifyRunning = NO;
         
-        // Fast, non-blocking check to see what is actually open
         for (NSRunningApplication *app in [[NSWorkspace sharedWorkspace] runningApplications]) {
             if ([app.bundleIdentifier isEqualToString:@"com.apple.Music"]) musicRunning = YES;
             if ([app.bundleIdentifier isEqualToString:@"com.spotify.client"]) spotifyRunning = YES;
         }
         
-        NSAppleEventDescriptor *descriptor = nil;
-        BOOL dataLoaded = NO;
+        __block NSString *tName = nil;
+        __block NSString *aName = nil;
+        __block double elapsed = 0.0;
+        __block double dur = 0.0;
+        BOOL success = NO;
         
-        // 1. Check Apple Music if running
+        // 1. EVALUATE APPLE MUSIC
         if (musicRunning) {
             NSAppleScript *musicScript = [[NSAppleScript alloc] initWithSource:
-                                          @"tell application \"Music\" to get {name of current track, artist of current track, player position, duration of current track}"];
-            descriptor = [musicScript executeAndReturnError:nil];
+                                          @"tell application \"Music\"\n"
+                                          @"if player state is playing or player state is paused then\n"
+                                          @"get {name of current track, artist of current track, player position, duration of current track}\n"
+                                          @"else\n"
+                                          @"return {\"No Track Playing\", \"—\", 0.0, 0.0}\n"
+                                          @"end if\n"
+                                          @"end tell"];
+            NSAppleEventDescriptor *descriptor = [musicScript executeAndReturnError:nil];
             
             if (descriptor && [descriptor numberOfItems] >= 4) {
-                NSString *tName = [[descriptor descriptorAtIndex:1] stringValue] ?: @"Unknown Title";
-                NSString *aName = [[descriptor descriptorAtIndex:2] stringValue] ?: @"Unknown Artist";
-                double elapsed = [[descriptor descriptorAtIndex:3] doubleValue];
-                double dur = [[descriptor descriptorAtIndex:4] doubleValue];
-                
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    self->_trackName = tName;
-                    self->_artistName = aName;
-                    self->_elapsedTime = elapsed;
-                    self->_duration = dur;
-                });
-                dataLoaded = YES;
+                tName = [[descriptor descriptorAtIndex:1] stringValue];
+                aName = [[descriptor descriptorAtIndex:2] stringValue];
+                elapsed = [[descriptor descriptorAtIndex:3] doubleValue];
+                dur = [[descriptor descriptorAtIndex:4] doubleValue];
+                success = YES;
             }
         }
         
-        // 2. Check Spotify if running and Music wasn't active
-        if (spotifyRunning && !dataLoaded) {
+        // 2. EVALUATE SPOTIFY FALLBACK
+        if (spotifyRunning && !success) {
             NSAppleScript *spotifyScript = [[NSAppleScript alloc] initWithSource:
-                                            @"tell application \"Spotify\" to get {name of current track, artist of current track, player position, duration of current track}"];
-            descriptor = [spotifyScript executeAndReturnError:nil];
+                                            @"tell application \"Spotify\"\n"
+                                            @"if player state is playing or player state is paused then\n"
+                                            @"get {name of current track, artist of current track, player position, duration of current track}\n"
+                                            @"else\n"
+                                            @"return {\"No Track Playing\", \"—\", 0.0, 0.0}\n"
+                                            @"end if\n"
+                                            @"end tell"];
+            NSAppleEventDescriptor *descriptor = [spotifyScript executeAndReturnError:nil];
             
             if (descriptor && [descriptor numberOfItems] >= 4) {
-                NSString *tName = [[descriptor descriptorAtIndex:1] stringValue] ?: @"Unknown Title";
-                NSString *aName = [[descriptor descriptorAtIndex:2] stringValue] ?: @"Unknown Artist";
-                double elapsed = [[descriptor descriptorAtIndex:3] doubleValue] / 1000.0;
-                double dur = [[descriptor descriptorAtIndex:4] doubleValue] / 1000.0;
+                tName = [[descriptor descriptorAtIndex:1] stringValue];
+                aName = [[descriptor descriptorAtIndex:2] stringValue];
+                elapsed = [[descriptor descriptorAtIndex:3] doubleValue];
+                dur = [[descriptor descriptorAtIndex:4] doubleValue];
                 
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    self->_trackName = tName;
-                    self->_artistName = aName;
-                    self->_elapsedTime = elapsed;
-                    self->_duration = dur;
-                });
-                dataLoaded = YES;
+                if (dur > 2000) {
+                    elapsed = elapsed / 1000.0;
+                    dur = dur / 1000.0;
+                }
+                success = YES;
             }
         }
         
-        // 3. Update UI based on results
-        if (dataLoaded) {
-            [self fetchArtworkForCurrentTrack];
-        } else {
-            dispatch_async(dispatch_get_main_queue(), ^{
+        // 3. BROADCAST TEXT METADATA
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (success && tName && ![tName isEqualToString:@"No Track Playing"]) {
+                self->_trackName = tName;
+                self->_artistName = aName ?: @"Unknown Artist";
+                self->_elapsedTime = elapsed;
+                self->_duration = dur;
+            } else {
                 self->_trackName = @"No Track Playing";
                 self->_artistName = @"—";
-                self->_duration = 0.0;
                 self->_elapsedTime = 0.0;
+                self->_duration = 0.0;
                 self->_albumArt = [NSImage imageNamed:NSImageNameTouchBarAudioInputTemplate];
-                [self notifyUI];
-            });
+            }
+            [self notifyUI];
+        });
+        
+        // 4. TRIGGER DECOUPLED ARTWORK DOWNLOAD
+        if (success && tName && ![tName isEqualToString:@"No Track Playing"]) {
+            [self fetchArtworkForCurrentTrackWithMusicRunning:musicRunning spotifyRunning:spotifyRunning];
         }
     });
 }
 
-- (void)fetchArtworkForCurrentTrack {
+- (void)fetchArtworkForCurrentTrackWithMusicRunning:(BOOL)musicRunning spotifyRunning:(BOOL)spotifyRunning {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSString *scriptSource = @"if application \"Music\" is running then\n"
-                                 @"tell application \"Music\"\n"
+        __block NSImage *img = nil;
+        
+        if (musicRunning) {
+            // We tell AppleScript to export the artwork data explicitly as a raw PICT/JPEG payload
+            NSString *musicSrc = @"tell application \"Music\"\n"
                                  @"if exists (current track) then\n"
-                                 @"tell current track to get raw data of artwork 1\n"
+                                 @"tell current track\n"
+                                 @"if exists (artwork 1) then\n"
+                                 @"set rawData to data of artwork 1\n"
+                                 @"return rawData\n"
                                  @"end if\n"
                                  @"end tell\n"
-                                 @"end if";
+                                 @"end if\n"
+                                 @"return missing value\n"
+                                 @"end tell";
+            
+            NSAppleScript *scr = [[NSAppleScript alloc] initWithSource:musicSrc];
+            NSAppleEventDescriptor *desc = [scr executeAndReturnError:nil];
+            
+            if (desc && [desc descriptorType] != 'msng') {
+                // Get the raw byte data from the Apple Event descriptor
+                NSData *rawData = [desc data];
+                
+                if (rawData && rawData.length > 0) {
+                    // Modern Apple Music embeds raw JPEG/PNG data inside an NSAppleEventDescriptor container.
+                    // If regular initialization fails, we strip the Apple Event descriptor header bytes.
+                    img = [[NSImage alloc] initWithData:rawData];
+                    
+                    if (!img && rawData.length > 512) {
+                        // Fallback: Strip potential legacy AppleScript data type headers (frequently 512 bytes)
+                        NSData *strippedData = [rawData subdataWithRange:NSMakeRange(512, rawData.length - 512)];
+                        img = [[NSImage alloc] initWithData:strippedData];
+                    }
+                }
+            }
+        }
         
-        NSAppleScript *artworkScript = [[NSAppleScript alloc] initWithSource:scriptSource];
-        NSAppleEventDescriptor *descriptor = [artworkScript executeAndReturnError:nil];
+        // --- SPOTIFY FALLBACK ---
+        if (!img && spotifyRunning) {
+            NSString *spotSrc = @"tell application \"Spotify\" to get artwork url of current track";
+            NSAppleScript *scr = [[NSAppleScript alloc] initWithSource:spotSrc];
+            NSAppleEventDescriptor *desc = [scr executeAndReturnError:nil];
+            NSString *urlStr = [desc stringValue];
+            if (urlStr && [urlStr hasPrefix:@"http"]) {
+                NSData *data = [NSData dataWithContentsOfURL:[NSURL URLWithString:urlStr]];
+                if (data) img = [[NSImage alloc] initWithData:data];
+            }
+        }
         
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (descriptor && [descriptor data]) {
-                self->_albumArt = [[NSImage alloc] initWithData:[descriptor data]];
+            // Update the image view on the main thread
+            if (img) {
+                self->_albumArt = img;
             } else {
                 self->_albumArt = [NSImage imageNamed:NSImageNameTouchBarAudioInputTemplate];
             }
