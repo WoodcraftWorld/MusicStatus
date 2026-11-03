@@ -2,7 +2,7 @@
 
 
 # System Requirements
-macOS: macOS Big Sur 11.5 or newer, Intel and Apple silicon support (Universal)
+macOS Big Sur 11.5 or newer, Intel and Apple silicon support (Universal)
 
 # Vibe Coding disclosure
 warning: fully vibe coded with Google Gemini\
